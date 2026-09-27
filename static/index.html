@@ -1,1 +1,62 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>电网恢复调度</title>
+<style>
+  body{font:15px/1.5 system-ui,sans-serif;max-width:1100px;margin:28px auto;padding:0 20px;color:#1f2933}
+  h1{font-size:22px}h2{font-size:17px;margin:24px 0 8px}h3{font-size:15px;margin:0}
+  .muted{color:#6b7280;font-size:13px}
+  button{padding:7px 14px;border-radius:6px;border:1px solid #cbd2d9;background:#fff;cursor:pointer}
+  button:hover{background:#f3f5f7}
+  .outage{border:1px solid #e4e7eb;border-radius:10px;padding:14px 16px;margin:12px 0;background:#fff}
+  .plan{display:flex;align-items:center;gap:10px;padding:9px 12px;margin:8px 0;border:1px solid #e4e7eb;border-radius:8px;background:#fafbfc}
+  .plan.active{border-color:#2f855a;background:#f0fdf4}
+  .plan.superseded{opacity:.62;background:#f7f8f9}
+  .badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+  .b-active{background:#2f855a;color:#fff}
+  .b-pending{background:#b7791f;color:#fff}
+  .b-draft{background:#e4e7eb;color:#3e4c59}
+  .b-superseded{background:#9aa5b1;color:#fff}
+  .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#fef3c7;color:#92400e;margin-left:6px}
+  .grow{flex:1}
+  details{margin-top:18px}pre{background:#f3f5f7;padding:14px;border-radius:8px;overflow:auto;font-size:12px}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p class="muted">计划版本状态：<span class="badge b-active">当前</span> 执行中并接收现场报告 ｜
+<span class="badge b-pending">待接替</span> 已审批，等待启用切换 ｜
+<span class="tag">接替中</span> 变更版本正在提交/审批，旧版本仍在执行 ｜
+<span class="badge b-superseded">已废止</span> 已被接替</p>
+<button onclick="loadState()">刷新状态</button>
+<div id="view" class="muted">加载中...</div>
+<details><summary class="muted">原始状态数据</summary><pre id="state"></pre></details>
+<script>
+const BADGE = {active:['b-active','当前'], pending:['b-pending','待接替'],
+  draft:['b-draft','草稿'], submitted:['b-draft','待审批'], approved:['b-draft','待启用'],
+  superseded:['b-superseded','已废止']};
+function el(html){const d=document.createElement('div');d.innerHTML=html.trim();return d.firstChild;}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function loadState(){
+  const data = await (await fetch('/api/state')).json();
+  state.textContent = JSON.stringify(data,null,2);
+  const view = document.getElementById('view'); view.textContent='';
+  if(!data.outages || !data.outages.length){view.textContent='暂无停运事故';return;}
+  for(const o of data.outages){
+    const plans = data.plans.filter(p=>p.outage_id===o.id).sort((a,b)=>b.version-a.version);
+    const box = el(`<div class="outage"><h3>${esc(o.incident_code)} · ${esc(o.title)}</h3>
+      <div class="muted">事故状态：${esc(o.state)} ｜ 计划版本 ${plans.length} 个</div><div class="plist"></div></div>`);
+    const list = box.querySelector('.plist');
+    for(const p of plans){
+      const [cls,label] = BADGE[p.state] || ['b-draft',p.state];
+      const tag = p.succeeding ? '<span class="tag">接替中</span>' : '';
+      const row = el(`<div class="plan ${p.state}">
+        <span class="badge ${cls}">${label}</span>${tag}
+        <span class="grow">v${p.version}（计划 #${p.id}）｜ 已确认步骤 ${p.confirmed_steps}/${p.total_steps} ｜ 修订 ${p.revision}</span>
+        <a class="muted" href="#" onclick="return false">详情 /api/plans/${p.id}</a></div>`);
+      list.appendChild(row);
+    }
+    view.appendChild(box);
+  }
+}
+loadState();
+</script>
+</html>
