@@ -55,6 +55,7 @@ class Store:
           version INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('draft','submitted','approved','active','superseded')),
           steps_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
           created_at TEXT NOT NULL, approved_by TEXT, approved_at TEXT, activated_at TEXT,
+          replaces_plan_id INTEGER REFERENCES plans(id),
           UNIQUE(outage_id,version)
         );
         CREATE TABLE IF NOT EXISTS confirmations (
@@ -82,6 +83,9 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(plans)")}
+        if "replaces_plan_id" not in cols:
+            self.conn.execute("ALTER TABLE plans ADD COLUMN replaces_plan_id INTEGER REFERENCES plans(id)")
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -183,33 +187,41 @@ class GridService:
     def activate_plan(self, actor: str | None, role: str | None, plan_id: int, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"dispatcher"}); plan = self._row("plans", plan_id)
         if plan["state"] != "approved": raise ApiError(409, "计划尚未批准")
+        predecessor = self.conn.execute("SELECT * FROM plans WHERE id=?", (plan["replaces_plan_id"],)).fetchone() if plan["replaces_plan_id"] else None
+        if predecessor and predecessor["state"] != "active": raise ApiError(409, "被接替的旧版本已不在执行中，无法启用接替版本")
         with self.conn:
-            self.conn.execute("UPDATE plans SET state='superseded' WHERE outage_id=? AND state='active'", (plan["outage_id"],))
+            if predecessor:
+                self.conn.execute("UPDATE plans SET state='superseded' WHERE id=?", (predecessor["id"],))
+            else:
+                self.conn.execute("UPDATE plans SET state='superseded' WHERE outage_id=? AND state='active'", (plan["outage_id"],))
             updated = self.conn.execute("UPDATE plans SET state='active',revision=revision+1,activated_at=? WHERE id=? AND revision=?",
                                         (now(), plan_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "计划版本冲突")
+            carried = self._carry_confirmations(predecessor, plan) if predecessor else []
             self.conn.execute("UPDATE outages SET state='restoring',revision=revision+1,updated_at=? WHERE id=?", (now(), plan["outage_id"]))
-            self.store.audit(actor, "plan.activate", "plan", plan_id, {"outage_id": plan["outage_id"], "version": plan["version"]})
+            self.store.audit(actor, "plan.activate", "plan", plan_id,
+                             {"outage_id": plan["outage_id"], "version": plan["version"], "replaces_plan": plan["replaces_plan_id"], "carried_steps": carried})
         return self._plan_dict(self._row("plans", plan_id))
 
     def make_plan_change(self, actor: str | None, role: str | None, base_plan_id: int, steps: list[dict], expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"dispatcher"}); base = self._row("plans", base_plan_id)
-        if base["state"] not in {"approved", "active"}: raise ApiError(409, "只有已批准或执行中的计划可以变更")
+        if base["state"] != "active": raise ApiError(409, "只有执行中的计划可以发起变更")
         if int(expected_revision) != int(base["revision"]): raise ApiError(409, "计划已被修改，请刷新版本")
+        pending = self.conn.execute("SELECT id FROM plans WHERE replaces_plan_id=? AND state IN ('draft','submitted','approved')",
+                                    (base_plan_id,)).fetchone()
+        if pending: raise ApiError(409, "该执行中计划已有待接替版本")
         normalized = self._validate_steps(steps)
-        confirmed = {row["step_no"]: row for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (base_plan_id,))}
         base_steps = {int(step["seq"]): step for step in json.loads(base["steps_json"])}
-        for seq in confirmed:
-            if seq not in {int(step["seq"]) for step in normalized} or normalized[[int(x["seq"]) for x in normalized].index(seq)] != base_steps[seq]:
-                raise ApiError(409, "新计划不能改动已确认步骤")
+        new_steps = {int(step["seq"]): step for step in normalized}
+        unchanged = [seq for seq, step in new_steps.items() if base_steps.get(seq) == step]
+        changed = sorted((set(base_steps) | set(new_steps)) - set(unchanged))
         outage = self._row("outages", base["outage_id"])
-        version = int(base["version"]) + 1
+        version = self.conn.execute("SELECT COALESCE(MAX(version),0)+1 FROM plans WHERE outage_id=?", (outage["id"],)).fetchone()[0]
         with self.conn:
-            cur = self.conn.execute("INSERT INTO plans(outage_id,version,state,steps_json,created_by,created_at) VALUES(?,?, 'draft',?,?,?)",
-                                    (outage["id"], version, j(normalized), actor, now()))
-            self.conn.execute("UPDATE plans SET state='superseded' WHERE id=?", (base_plan_id,))
-            self._copy_confirmations(base_plan_id, cur.lastrowid, normalized, confirmed)
-            self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid, {"base_plan": base_plan_id, "version": version, "carried_confirmations": len(confirmed)})
+            cur = self.conn.execute("INSERT INTO plans(outage_id,version,state,steps_json,created_by,created_at,replaces_plan_id) VALUES(?,?,'draft',?,?,?,?)",
+                                    (outage["id"], version, j(normalized), actor, now(), base_plan_id))
+            self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid,
+                             {"base_plan": base_plan_id, "version": version, "unchanged_steps": unchanged, "changed_steps": changed})
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
     def field_report(self, actor: str | None, role: str | None, plan_id: int, step_no: int, client_report_id: str, expected_plan_version: int, status: str, note: str = "") -> dict:
@@ -220,7 +232,8 @@ class GridService:
         duplicate = self.conn.execute("SELECT * FROM field_reports WHERE client_report_id=?", (client_report_id,)).fetchone()
         if duplicate: return dict(duplicate)
         merge_status, conflict = "merged", None
-        if plan["state"] != "active": merge_status, conflict = "conflict", "计划尚未激活"
+        if plan["state"] == "superseded": merge_status, conflict = "conflict", "计划版本已废止，现场报告只能发给当前执行版本"
+        elif plan["state"] != "active": merge_status, conflict = "conflict", "计划尚未启用"
         elif int(expected_plan_version) != int(plan["version"]): merge_status, conflict = "conflict", "现场报告基于旧计划版本"
         elif self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone():
             merge_status, conflict = "protected", "已确认记录不能由普通现场报告覆盖"
@@ -256,6 +269,8 @@ class GridService:
         actor = self._actor(actor, role, {"dispatcher"})
         plan = self._row("plans", plan_id); outage = self._row("outages", outage_id)
         if plan["outage_id"] != outage_id: raise ApiError(400, "计划不属于该事故")
+        if plan["state"] == "superseded": raise ApiError(409, "已废止版本不能发布状态")
+        if plan["state"] != "active": raise ApiError(409, "只有当前启用版本可以发布状态")
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
         steps = json.loads(plan["steps_json"])
         completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
@@ -294,13 +309,18 @@ class GridService:
             for dependency in step.get("depends_on", []):
                 if int(dependency) >= int(step["seq"]): raise ApiError(409, "计划依赖顺序不安全")
 
-    def _copy_confirmations(self, old_plan_id: int, new_plan_id: int, steps: list[dict], confirmed: dict[int, sqlite3.Row]) -> None:
-        for step in steps:
-            seq = int(step["seq"])
-            if seq in confirmed:
-                old = confirmed[seq]
+    def _carry_confirmations(self, predecessor: sqlite3.Row, new_plan: sqlite3.Row) -> list[int]:
+        """启用接替版本时一次性切换：仅把内容未改动步骤的确认/受阻记录带到新版本。"""
+        old_steps = {int(step["seq"]): step for step in json.loads(predecessor["steps_json"])}
+        new_steps = {int(step["seq"]): step for step in json.loads(new_plan["steps_json"])}
+        carried: list[int] = []
+        for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (predecessor["id"],)):
+            seq = int(row["step_no"])
+            if old_steps.get(seq) == new_steps.get(seq):
                 self.conn.execute("INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)",
-                                  (new_plan_id, seq, old["status"], old["confirmed_by"], old["confirmed_at"], old["note"]))
+                                  (new_plan["id"], seq, row["status"], row["confirmed_by"], row["confirmed_at"], row["note"]))
+                carried.append(seq)
+        return carried
 
     def _plan_update(self, plan: sqlite3.Row, state: str, expected_revision: int, actor: str, action: str, details: dict) -> None:
         if int(expected_revision) != int(plan["revision"]): raise ApiError(409, "计划版本冲突")
@@ -318,8 +338,18 @@ class GridService:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
                 "affected_regions": json.loads(row["affected_regions_json"]), "revision": row["revision"]}
 
+    @staticmethod
+    def _lifecycle(row: sqlite3.Row) -> tuple[str, str]:
+        state = row["state"]
+        if state == "active": return "current", "当前"
+        if state == "superseded": return "superseded", "已废止"
+        return ("pending_succession", "待接替") if row["replaces_plan_id"] else ("draft", "草稿")
+
     def _plan_dict(self, row: sqlite3.Row) -> dict:
+        lifecycle, lifecycle_label = self._lifecycle(row)
         return {"id": row["id"], "outage_id": row["outage_id"], "version": row["version"], "state": row["state"],
+                "lifecycle": lifecycle, "lifecycle_label": lifecycle_label,
+                "replaces_plan_id": row["replaces_plan_id"],
                 "steps": json.loads(row["steps_json"]), "revision": row["revision"]}
 
     def state(self) -> dict:

@@ -1,1 +1,33 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px;color:#1f2933}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+table{border-collapse:collapse;width:100%;margin:12px 0 24px}
+th,td{border:1px solid #d9dee3;padding:8px 10px;text-align:left;font-size:14px}
+th{background:#eef1f4}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:600;color:#fff}
+.badge-current{background:#1a7f37}.badge-pending_succession{background:#b26a00}.badge-superseded{background:#8a949e}.badge-draft{background:#31628c}
+.muted{color:#7a8590}
+</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。计划阶段区分：当前（执行中）、待接替（变更审批中，旧版本仍接报告）、已废止、草稿。</p>
+<button onclick="loadState()">刷新状态</button>
+<h2>恢复计划</h2>
+<table><thead><tr><th>计划</th><th>事故</th><th>版本</th><th>阶段</th><th>接替</th><th>步骤</th><th>修订</th></tr></thead>
+<tbody id="plans"><tr><td colspan="7">加载中...</td></tr></tbody></table>
+<details><summary>完整状态 JSON</summary><pre id="state">加载中...</pre></details>
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function loadState(){
+  const data = await (await fetch('/api/state')).json();
+  state.textContent = JSON.stringify(data, null, 2);
+  const outages = Object.fromEntries((data.outages||[]).map(o => [o.id, o.incident_code]));
+  plans.innerHTML = (data.plans||[]).map(p => `<tr>
+    <td>#${p.id}</td><td>${esc(outages[p.outage_id] ?? p.outage_id)}</td><td>v${p.version}</td>
+    <td><span class="badge badge-${p.lifecycle}">${esc(p.lifecycle_label)}</span> <span class="muted">(${p.state})</span></td>
+    <td>${p.replaces_plan_id ? '接替 #'+p.replaces_plan_id : '—'}</td>
+    <td>${p.steps.length}</td><td>${p.revision}</td></tr>`).join('') || '<tr><td colspan="7">暂无计划</td></tr>';
+}
+loadState();
+</script></html>
